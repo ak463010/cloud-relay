@@ -45,6 +45,18 @@ function createFrame(type, flags, requestId, payloadBuffer) {
 
 // HTTP Server for Browser Clients
 const server = http.createServer((req, res) => {
+    // Health / liveness check endpoint for orchestrators (Dokploy, Docker, Traefik, K8s)
+    if (req.url === '/health' || req.url === '/ping') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: 'ok',
+            deviceConnected: !!(activeDeviceSocket && activeDeviceSocket.readyState === 1),
+            deviceId: activeDeviceId,
+            uptime: Math.floor(process.uptime())
+        }));
+        return;
+    }
+
     // Basic Auth Gate (if WEB_PASSWORD is set)
     if (WEB_PASSWORD) {
         const authHeader = req.headers['authorization'];
@@ -285,5 +297,29 @@ server.listen(PORT, () => {
     console.log(` BS Fountain Controller Cloud Relay running on port ${PORT}`);
     console.log(` Remote Web Interface: http://localhost:${PORT}`);
     console.log(` Device Tunnel Endpoint: ws://localhost:${PORT}/device-tunnel`);
+    console.log(` Health Check: http://localhost:${PORT}/health`);
     console.log(`=======================================================`);
 });
+
+// Graceful shutdown handling for container orchestrators (SIGTERM / SIGINT)
+const shutdown = (signal) => {
+    console.log(`[Relay] Received ${signal}, shutting down gracefully...`);
+    if (activeDeviceSocket) {
+        try {
+            activeDeviceSocket.close(1001, 'Server shutting down');
+        } catch (_) {}
+    }
+    server.close(() => {
+        console.log('[Relay] Server closed cleanly.');
+        process.exit(0);
+    });
+    // Force exit after 5 seconds if lingering connections keep loop open
+    setTimeout(() => {
+        console.warn('[Relay] Forcing process exit.');
+        process.exit(0);
+    }, 5000).unref();
+};
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
