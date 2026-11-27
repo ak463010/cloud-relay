@@ -35,10 +35,10 @@ const MAX_QUEUED_REQUESTS = 16;
 const REQUEST_IDLE_MS = 60000;
 const MAX_BODY_CHUNK = 3500;
 
-function sendError(res, status, error) {
+function sendError(res, status, error, code) {
     if (!res.headersSent) {
-        res.writeHead(status, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error }));
+        res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, error, code }));
     } else {
         // A partial download is not a successful HTTP response.
         res.destroy();
@@ -79,6 +79,7 @@ async function sendRequestFrame(job, type, flags, payload) {
         job.ws.send(createFrame(type, flags, job.id, payload), err => err ? reject(err) : resolve());
     });
     if (job !== activeRequest) return false;
+    if (type === FRAME_REQ_BODY && payload) job.forwardedBytes += payload.length;
     job.timer.refresh();
     return true;
 }
@@ -155,7 +156,13 @@ const server = http.createServer((req, res) => {
     }
 
     if (!activeDeviceSocket || activeDeviceSocket.readyState !== 1) {
-        res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8' });
+        req.resume();
+        const path = req.url.split('?', 1)[0];
+        if (req.method !== 'GET' || path === '/api' || path.startsWith('/api/')) {
+            sendError(res, 503, 'The controller tunnel is offline. Wait for it to reconnect, then retry.', 'TUNNEL_OFFLINE');
+            return;
+        }
+        res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(`
             <!doctype html>
             <html>
@@ -178,11 +185,11 @@ const server = http.createServer((req, res) => {
     }
     if (requestQueue.length >= MAX_QUEUED_REQUESTS) {
         req.resume();
-        sendError(res, 503, 'Controller is busy; retry after the current operation finishes');
+        sendError(res, 503, 'Controller is busy; retry after the current operation finishes.', 'CONTROLLER_BUSY');
         return;
     }
 
-    const job = { id: nextRequestId++, req, res, ws: activeDeviceSocket };
+    const job = { id: nextRequestId++, req, res, ws: activeDeviceSocket, forwardedBytes: 0 };
     if (nextRequestId >= 0x7fffffff) nextRequestId = 1;
     job.timer = setTimeout(() => finishRequest(job, {
         status: 504, error: 'Timed out waiting for the controller to finish another request',
@@ -286,7 +293,12 @@ wss.on('connection', (ws, req, deviceId) => {
         console.log(`[Tunnel] Controller disconnected (code: ${code}, reason: ${reason})`);
         if (activeDeviceSocket === ws) activeDeviceSocket = null;
         const failure = { status: 502, error: 'Controller connection closed prematurely' };
-        if (activeRequest?.ws === ws) finishRequest(activeRequest, failure);
+        if (activeRequest?.ws === ws) {
+            const job = activeRequest;
+            const expectedBytes = Number(job.req.headers['content-length']) || 0;
+            console.warn(`[Tunnel] Disconnected during request ${job.id} (${job.req.method}): ${job.forwardedBytes}/${expectedBytes} body bytes sent to WebSocket`);
+            finishRequest(job, failure);
+        }
         for (const job of [...requestQueue]) {
             if (job.ws === ws) finishRequest(job, failure);
         }
