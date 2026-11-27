@@ -28,7 +28,83 @@ const FLAG_ERROR = 0x02;
 let activeDeviceSocket = null;
 let activeDeviceId = 'unknown';
 let nextRequestId = 1;
-const pendingRequests = new Map(); // requestId -> { req, res, timer }
+// The controller owns one loopback HTTP socket, not one socket per request ID.
+const requestQueue = [];
+let activeRequest = null;
+const MAX_QUEUED_REQUESTS = 16;
+const REQUEST_IDLE_MS = 60000;
+const MAX_BODY_CHUNK = 3500;
+
+function sendError(res, status, error) {
+    if (!res.headersSent) {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error }));
+    } else {
+        // A partial download is not a successful HTTP response.
+        res.destroy();
+    }
+}
+
+function finishRequest(job, { abort = false, status, error } = {}) {
+    if (job === activeRequest) {
+        activeRequest = null;
+        if (abort && job.ws.readyState === 1) {
+            job.ws.send(createFrame(FRAME_REQ_ABORT, FLAG_ERROR, job.id, null), () => {});
+        }
+    } else {
+        const index = requestQueue.indexOf(job);
+        if (index < 0) return;
+        requestQueue.splice(index, 1);
+    }
+    clearTimeout(job.timer);
+    job.req.resume(); // Drain any unforwarded body without buffering it.
+    if (status && !job.res.destroyed) sendError(job.res, status, error);
+    queueMicrotask(startNextRequest);
+}
+
+function startNextRequest() {
+    if (activeRequest || requestQueue.length === 0) return;
+    const job = requestQueue.shift();
+    activeRequest = job;
+    clearTimeout(job.timer);
+    job.timer = setTimeout(() => finishRequest(job, {
+        abort: true, status: 504, error: 'No progress forwarding the request to the controller for 60 seconds',
+    }), REQUEST_IDLE_MS);
+    void forwardRequest(job);
+}
+
+async function sendRequestFrame(job, type, flags, payload) {
+    if (job !== activeRequest || job.ws.readyState !== 1) return false;
+    await new Promise((resolve, reject) => {
+        job.ws.send(createFrame(type, flags, job.id, payload), err => err ? reject(err) : resolve());
+    });
+    if (job !== activeRequest) return false;
+    job.timer.refresh();
+    return true;
+}
+
+async function forwardRequest(job) {
+    const { req } = job;
+    const headers = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+        if (key !== 'authorization' && key !== 'host' && key !== 'connection') headers[key] = value;
+    }
+    const hasBody = Number(req.headers['content-length']) > 0 || Boolean(req.headers['transfer-encoding']);
+    const meta = Buffer.from(JSON.stringify({ method: req.method, path: req.url, headers }));
+    try {
+        if (!await sendRequestFrame(job, FRAME_REQ_START, hasBody ? FLAG_NONE : FLAG_EOF, meta)) return;
+        if (!hasBody) return;
+        for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+            for (let i = 0; i < chunk.length; i += MAX_BODY_CHUNK) {
+                if (!await sendRequestFrame(job, FRAME_REQ_BODY, FLAG_NONE, chunk.subarray(i, i + MAX_BODY_CHUNK))) return;
+            }
+        }
+        await sendRequestFrame(job, FRAME_REQ_BODY, FLAG_EOF, null);
+    } catch (err) {
+        finishRequest(job, { abort: true, status: 502, error: 'Could not forward the request to the controller' });
+        console.warn(`Request ${job.id} forwarding failed: ${err.message}`);
+    }
+}
 
 function createFrame(type, flags, requestId, payloadBuffer) {
     const len = payloadBuffer ? payloadBuffer.length : 0;
@@ -95,79 +171,26 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    const requestId = nextRequestId++;
+    if (req.headers['transfer-encoding']) {
+        req.resume();
+        sendError(res, 411, 'The controller requires a fixed Content-Length for request bodies');
+        return;
+    }
+    if (requestQueue.length >= MAX_QUEUED_REQUESTS) {
+        req.resume();
+        sendError(res, 503, 'Controller is busy; retry after the current operation finishes');
+        return;
+    }
+
+    const job = { id: nextRequestId++, req, res, ws: activeDeviceSocket };
     if (nextRequestId >= 0x7fffffff) nextRequestId = 1;
-
-    // Request Timeout Guard (60 seconds)
-    const timeout = setTimeout(() => {
-        if (pendingRequests.has(requestId)) {
-            pendingRequests.delete(requestId);
-            if (!res.headersSent) {
-                res.writeHead(504, { 'Content-Type': 'text/plain' });
-                res.end('Gateway Timeout: Controller did not respond in time');
-            } else {
-                res.end();
-            }
-            if (activeDeviceSocket && activeDeviceSocket.readyState === 1) {
-                activeDeviceSocket.send(createFrame(FRAME_REQ_ABORT, FLAG_ERROR, requestId, null));
-            }
-        }
-    }, 60000);
-
-    pendingRequests.set(requestId, { req, res, timeout });
-
-    // Sanitize headers to forward to ESP32
-    const forwardHeaders = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-        const lower = k.toLowerCase();
-        if (lower !== 'authorization' && lower !== 'host' && lower !== 'connection') {
-            forwardHeaders[lower] = v;
-        }
-    }
-
-    const startPayload = Buffer.from(JSON.stringify({
-        method: req.method,
-        path: req.url,
-        headers: forwardHeaders
-    }), 'utf8');
-
-    // Detect if this request has a body
-    const hasBody = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
-
-    if (!hasBody) {
-        // Send REQ_START with FLAG_EOF
-        activeDeviceSocket.send(createFrame(FRAME_REQ_START, FLAG_EOF, requestId, startPayload));
-    } else {
-        // Send REQ_START
-        activeDeviceSocket.send(createFrame(FRAME_REQ_START, FLAG_NONE, requestId, startPayload));
-
-        req.on('data', chunk => {
-            if (activeDeviceSocket && activeDeviceSocket.readyState === 1) {
-                const MAX_CHUNK = 3500;
-                for (let i = 0; i < chunk.length; i += MAX_CHUNK) {
-                    const sub = chunk.subarray(i, Math.min(chunk.length, i + MAX_CHUNK));
-                    activeDeviceSocket.send(createFrame(FRAME_REQ_BODY, FLAG_NONE, requestId, sub));
-                }
-            }
-        });
-
-        req.on('end', () => {
-            if (activeDeviceSocket && activeDeviceSocket.readyState === 1) {
-                activeDeviceSocket.send(createFrame(FRAME_REQ_BODY, FLAG_EOF, requestId, Buffer.alloc(0)));
-            }
-        });
-
-        req.on('error', err => {
-            console.error(`Request ${requestId} read error:`, err);
-            if (pendingRequests.has(requestId)) {
-                clearTimeout(timeout);
-                pendingRequests.delete(requestId);
-            }
-            if (activeDeviceSocket && activeDeviceSocket.readyState === 1) {
-                activeDeviceSocket.send(createFrame(FRAME_REQ_ABORT, FLAG_ERROR, requestId, null));
-            }
-        });
-    }
+    job.timer = setTimeout(() => finishRequest(job, {
+        status: 504, error: 'Timed out waiting for the controller to finish another request',
+    }), REQUEST_IDLE_MS);
+    req.on('error', () => finishRequest(job, { abort: true, status: 502, error: 'Browser request was interrupted' }));
+    res.on('close', () => finishRequest(job, { abort: true }));
+    requestQueue.push(job);
+    startNextRequest();
 });
 
 // WebSocket Server for ESP32-S3 Controller
@@ -223,10 +246,11 @@ wss.on('connection', (ws, req, deviceId) => {
         const requestId = data.readUInt32BE(4);
         const payload = data.subarray(8, 8 + length);
 
-        const pending = pendingRequests.get(requestId);
-        if (!pending) return;
+        const job = activeRequest;
+        if (!job || job.ws !== ws || job.id !== requestId) return;
 
-        const { res, timeout } = pending;
+        const { res } = job;
+        job.timer.refresh();
 
         if (type === FRAME_RES_START) {
             try {
@@ -243,47 +267,28 @@ wss.on('connection', (ws, req, deviceId) => {
                 res.writeHead(meta.status || 200, meta.statusText || 'OK', cleanHeaders);
             } catch (err) {
                 console.error(`Error parsing RES_START JSON for req ${requestId}:`, err);
-                clearTimeout(timeout);
-                pendingRequests.delete(requestId);
-                res.writeHead(502, { 'Content-Type': 'text/plain' });
-                res.end('Bad Gateway: Malformed response headers from controller');
+                finishRequest(job, { abort: true, status: 502, error: 'Malformed response headers from controller' });
             }
         } else if (type === FRAME_RES_DATA) {
             if (payload.length > 0) {
                 res.write(payload);
             }
             if ((flags & FLAG_EOF) !== 0) {
-                clearTimeout(timeout);
-                pendingRequests.delete(requestId);
+                finishRequest(job);
                 res.end();
             }
         } else if (type === FRAME_RES_ABORT) {
-            clearTimeout(timeout);
-            pendingRequests.delete(requestId);
-            if (!res.headersSent) {
-                res.writeHead(502, { 'Content-Type': 'text/plain' });
-                res.end('Bad Gateway: Controller aborted response');
-            } else {
-                res.end();
-            }
+            finishRequest(job, { status: 502, error: 'Controller aborted the request' });
         }
     });
 
     ws.on('close', (code, reason) => {
         console.log(`[Tunnel] Controller disconnected (code: ${code}, reason: ${reason})`);
-        if (activeDeviceSocket === ws) {
-            activeDeviceSocket = null;
-            // Clean up any pending requests
-            for (const [id, pending] of pendingRequests.entries()) {
-                clearTimeout(pending.timeout);
-                if (!pending.res.headersSent) {
-                    pending.res.writeHead(502, { 'Content-Type': 'text/plain' });
-                    pending.res.end('Bad Gateway: Controller connection closed prematurely');
-                } else {
-                    pending.res.end();
-                }
-            }
-            pendingRequests.clear();
+        if (activeDeviceSocket === ws) activeDeviceSocket = null;
+        const failure = { status: 502, error: 'Controller connection closed prematurely' };
+        if (activeRequest?.ws === ws) finishRequest(activeRequest, failure);
+        for (const job of [...requestQueue]) {
+            if (job.ws === ws) finishRequest(job, failure);
         }
     });
 
