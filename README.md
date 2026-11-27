@@ -9,8 +9,8 @@ This lightweight Node.js relay server allows you to remotely access and configur
 1. The **ESP32-S3 Controller** establishes an outbound secure WebSocket connection (`wss://your-relay-host/device-tunnel`) to this server as soon as it connects to Wi-Fi.
 2. When you open `https://your-relay-host` in your web browser (phone or laptop), this relay server:
    - Authenticates you (via HTTP Basic Auth).
-   - Multiplexes your browser's HTTP requests directly to the ESP32 through the open WebSocket tunnel.
-   - Streams the ESP32's responses, web UI, SD card file transfers, and APIs back to your browser with zero latency.
+   - Queues browser HTTP requests and forwards them one at a time through the open WebSocket tunnel.
+   - Streams requests and responses, including SD card uploads and downloads, without buffering entire files.
 
 ---
 
@@ -52,6 +52,24 @@ export TUNNEL_TOKEN="my-secret-token"
 export WEB_PASSWORD="my-secure-password"
 node relay.js
 ```
+
+---
+
+## Slow uploads through Dokploy / Traefik
+
+If a remote upload fails consistently at about the same **elapsed time**, check the proxy's upload deadline. Traefik's `readTimeout` defaults to `60s` in current versions and covers the **entire request body**, even if bytes are still arriving. Because the relay streams to the ESP32, a slow WAN link or controller can make the browser take longer to finish sending.
+
+If the proxy deadline is the cause, merge a finite timeout sized for your expected upload speed into Traefik's **static** configuration. For example, on the HTTPS entry point (usually `websecure`):
+
+```yaml
+entryPoints:
+  websecure:
+    transport:
+      respondingTimeouts:
+        readTimeout: 15m
+```
+
+Keep the existing entry-point settings. Apply this to Traefik itself, not to the relay application's Docker labels. This affects every router on that entry point, and reloading static configuration may briefly interrupt service. The relay has its own 15-minute HTTP request deadline and a separate 60-second inactivity timer for the forwarded request. If the upload still fails, check the Traefik and relay logs at the same timestamp. The relay logs elapsed time, whether it received a complete HTTP request, and how many body bytes it handed to the WebSocket; that last number is not an SD-write acknowledgment.
 
 ---
 

@@ -33,6 +33,8 @@ const requestQueue = [];
 let activeRequest = null;
 const MAX_QUEUED_REQUESTS = 16;
 const REQUEST_IDLE_MS = 60000;
+// Node's default requestTimeout can end a slow but progressing upload after 5 min.
+const REQUEST_READ_MS = 15 * 60 * 1000;
 const MAX_BODY_CHUNK = 3500;
 
 function sendError(res, status, error, code) {
@@ -45,8 +47,9 @@ function sendError(res, status, error, code) {
     }
 }
 
-function finishRequest(job, { abort = false, status, error } = {}) {
-    if (job === activeRequest) {
+function finishRequest(job, { abort = false, status, error, code } = {}) {
+    const wasActive = job === activeRequest;
+    if (wasActive) {
         activeRequest = null;
         if (abort && job.ws.readyState === 1) {
             job.ws.send(createFrame(FRAME_REQ_ABORT, FLAG_ERROR, job.id, null), () => {});
@@ -57,8 +60,13 @@ function finishRequest(job, { abort = false, status, error } = {}) {
         requestQueue.splice(index, 1);
     }
     clearTimeout(job.timer);
+    if (wasActive && job.expectedBytes > 0 && (status || abort)) {
+        const cause = code || (status ? `HTTP_${status}` : 'HTTP_PEER_CLOSED');
+        const elapsedMs = Date.now() - job.startedAt;
+        console.warn(`[Tunnel] Request ${job.id} (${job.req.method}) ended: ${cause}; ${elapsedMs} ms, ${job.forwardedBytes}/${job.expectedBytes} body bytes sent to WebSocket, HTTP body ${job.req.complete ? 'complete' : 'incomplete'}`);
+    }
     job.req.resume(); // Drain any unforwarded body without buffering it.
-    if (status && !job.res.destroyed) sendError(job.res, status, error);
+    if (status && !job.res.destroyed) sendError(job.res, status, error, code);
     queueMicrotask(startNextRequest);
 }
 
@@ -66,9 +74,11 @@ function startNextRequest() {
     if (activeRequest || requestQueue.length === 0) return;
     const job = requestQueue.shift();
     activeRequest = job;
+    job.startedAt = Date.now();
     clearTimeout(job.timer);
     job.timer = setTimeout(() => finishRequest(job, {
-        abort: true, status: 504, error: 'No progress forwarding the request to the controller for 60 seconds',
+        abort: true, status: 504, code: 'TUNNEL_REQUEST_IDLE',
+        error: 'No progress forwarding the request to the controller for 60 seconds',
     }), REQUEST_IDLE_MS);
     void forwardRequest(job);
 }
@@ -90,7 +100,7 @@ async function forwardRequest(job) {
     for (const [key, value] of Object.entries(req.headers)) {
         if (key !== 'authorization' && key !== 'host' && key !== 'connection') headers[key] = value;
     }
-    const hasBody = Number(req.headers['content-length']) > 0 || Boolean(req.headers['transfer-encoding']);
+    const hasBody = job.expectedBytes > 0;
     const meta = Buffer.from(JSON.stringify({ method: req.method, path: req.url, headers }));
     try {
         if (!await sendRequestFrame(job, FRAME_REQ_START, hasBody ? FLAG_NONE : FLAG_EOF, meta)) return;
@@ -102,7 +112,7 @@ async function forwardRequest(job) {
         }
         await sendRequestFrame(job, FRAME_REQ_BODY, FLAG_EOF, null);
     } catch (err) {
-        finishRequest(job, { abort: true, status: 502, error: 'Could not forward the request to the controller' });
+        finishRequest(job, { abort: true, status: 502, code: 'TUNNEL_FORWARD_FAILED', error: 'Could not forward the request to the controller' });
         console.warn(`Request ${job.id} forwarding failed: ${err.message}`);
     }
 }
@@ -121,7 +131,7 @@ function createFrame(type, flags, requestId, payloadBuffer) {
 }
 
 // HTTP Server for Browser Clients
-const server = http.createServer((req, res) => {
+const server = http.createServer({ requestTimeout: REQUEST_READ_MS }, (req, res) => {
     // Health / liveness check endpoint for orchestrators (Dokploy, Docker, Traefik, K8s)
     if (req.url === '/health' || req.url === '/ping') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -189,12 +199,15 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    const job = { id: nextRequestId++, req, res, ws: activeDeviceSocket, forwardedBytes: 0 };
+    const expectedBytes = Number(req.headers['content-length']) || 0;
+    const job = { id: nextRequestId++, req, res, ws: activeDeviceSocket, expectedBytes, forwardedBytes: 0 };
     if (nextRequestId >= 0x7fffffff) nextRequestId = 1;
     job.timer = setTimeout(() => finishRequest(job, {
-        status: 504, error: 'Timed out waiting for the controller to finish another request',
+        status: 504, code: 'TUNNEL_QUEUE_TIMEOUT', error: 'Timed out waiting for the controller to finish another request',
     }), REQUEST_IDLE_MS);
-    req.on('error', () => finishRequest(job, { abort: true, status: 502, error: 'Browser request was interrupted' }));
+    req.on('error', () => finishRequest(job, {
+        abort: true, status: 502, code: 'HTTP_REQUEST_INTERRUPTED', error: 'The relay stopped receiving the incoming HTTP request',
+    }));
     res.on('close', () => finishRequest(job, { abort: true }));
     requestQueue.push(job);
     startNextRequest();
@@ -285,20 +298,15 @@ wss.on('connection', (ws, req, deviceId) => {
                 res.end();
             }
         } else if (type === FRAME_RES_ABORT) {
-            finishRequest(job, { status: 502, error: 'Controller aborted the request' });
+            finishRequest(job, { status: 502, code: 'CONTROLLER_ABORTED', error: 'The controller aborted the request. Check its serial log.' });
         }
     });
 
     ws.on('close', (code, reason) => {
         console.log(`[Tunnel] Controller disconnected (code: ${code}, reason: ${reason})`);
         if (activeDeviceSocket === ws) activeDeviceSocket = null;
-        const failure = { status: 502, error: 'Controller connection closed prematurely' };
-        if (activeRequest?.ws === ws) {
-            const job = activeRequest;
-            const expectedBytes = Number(job.req.headers['content-length']) || 0;
-            console.warn(`[Tunnel] Disconnected during request ${job.id} (${job.req.method}): ${job.forwardedBytes}/${expectedBytes} body bytes sent to WebSocket`);
-            finishRequest(job, failure);
-        }
+        const failure = { status: 502, code: 'TUNNEL_DISCONNECTED', error: 'The controller tunnel disconnected before the request completed' };
+        if (activeRequest?.ws === ws) finishRequest(activeRequest, failure);
         for (const job of [...requestQueue]) {
             if (job.ws === ws) finishRequest(job, failure);
         }
